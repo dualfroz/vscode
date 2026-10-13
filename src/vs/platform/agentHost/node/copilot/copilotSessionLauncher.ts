@@ -23,11 +23,10 @@ import { IAgentHostOTelService } from '../../common/otel/agentHostOTelService.js
 import { reasoningEffortLevels, type ReasoningEffortLevel } from '../../common/reasoningEffort.js';
 import { getSessionSandboxConfig } from '../sessionSandbox.js';
 import { projectCopilotSandboxPolicy } from './copilotSandboxPolicy.js';
-import { autoModeTiers, isAutoModeTier, normalizeAutoModeTier, type AutoModeTier } from '../../common/autoModeTiers.js';
+import { autoModeTiers, defaultAutoModeTier, isAutoModeTier, normalizeAutoModeTier, type AutoModeTier } from '../../common/autoModeTiers.js';
 import { SEMANTIC_SEARCH_TOOL_NAME } from '../../common/semanticSearchConstants.js';
 import type { ModelSelection, ToolDefinition } from '../../common/state/protocol/state.js';
 import { ContextSizeConfigKey } from '../../common/agentModelConfiguration.js';
-import { RUNTIME_TOOL_SEARCH_TOOL_NAME } from '../../common/toolSearchConstants.js';
 import type { ActiveClientToolSet } from '../activeClientState.js';
 import { IAgentConfigurationService } from '../agentConfigurationService.js';
 import { IAgentHostManagedSettingsService } from '../agentHostManagedSettingsService.js';
@@ -37,11 +36,12 @@ import { IByokLmBridgeRegistry } from '../byokLmBridgeRegistry.js';
 import { IByokLmProxyService, type IByokLmProxyHandle } from './byokLmProxyService.js';
 import type { ICopilotMcpServerInfo, ICopilotPluginInfo } from './copilotAgent.js';
 import { CopilotGitHubSessionCredentials } from './copilotGitHubCredentials.js';
-import { toSdkHooks, toSdkInstructionDirectories, toSdkMcpServers, toSdkMcpServersFromConfigMap, toSdkSessionCustomAgents, toSdkSkillDirectories } from './copilotPluginConverters.js';
+import { toSdkClientToolName, toSdkHooks, toSdkInstructionDirectories, toSdkMcpServers, toSdkMcpServersFromConfigMap, toSdkSessionCustomAgents, toSdkSkillDirectories } from './copilotPluginConverters.js';
+import { buildCopilotBuiltinAgents, COPILOT_BUILTIN_AGENT_NAMES } from './copilotBuiltinAgents.js';
 import { CopilotSessionWrapper, type ICopilotByokSessionConfig } from './copilotSessionWrapper.js';
 import { ShellManager, createShellTools, type IUnsandboxedCommandConfirmationRequest } from './copilotShellTools.js';
 import { isAutoModel, isGpt56Model } from './modelIdentifiers.js';
-import { EPHEMERAL_DISABLED_COPILOT_TOOLS } from './copilotToolDisplay.js';
+import { CopilotToolName, EPHEMERAL_DISABLED_COPILOT_TOOLS } from './copilotToolDisplay.js';
 import './prompts/allPrompts.js';
 import { agentHostPromptRegistry, type IAgentHostPromptContext } from './prompts/promptRegistry.js';
 import { applyConfiguredPromptOverrides } from './prompts/promptOverride.js';
@@ -63,6 +63,11 @@ export const ContextTierConfigKey = 'contextTier';
  * Copilot Chat extension's `AUTO_MODE_TIER_PROPERTY` so both Auto surfaces use the same picker key.
  */
 export const AutoTierConfigKey = 'tier';
+
+const catalogInstallationFeatureFlags = {
+	CATALOG_SEARCH: true,
+	AGENT_FINDER_SKILL_INSTALL: true,
+} as const;
 
 /**
  * Every reasoning-effort tier that the runtime may advertise via a model's
@@ -199,11 +204,6 @@ export function filterClientToolNames(names: ReadonlySet<string>, availableTools
 		}
 	}
 	return result;
-}
-
-/** The SDK-registered name for a client tool; only the tool-search tool differs. */
-function toSdkClientToolName(name: string): string {
-	return name === CLIENT_TOOL_SEARCH_REFERENCE_NAME ? RUNTIME_TOOL_SEARCH_TOOL_NAME : name;
 }
 
 /** Maps Agent Host reference names to the names registered with the SDK. */
@@ -531,7 +531,16 @@ function resolveConfiguredAutoTierOverride(model: ModelSelection | undefined, co
 		return undefined;
 	}
 	logService.info(`[Copilot:${sessionId}] Applying Auto "Optimize for" override '${tier}'`);
-	return tier;
+	return toEnsembleTier(tier, configurationService, logService, sessionId);
+}
+
+/** Ensemble offers no Efficiency, so it runs as Ensemble's default instead. */
+function toEnsembleTier(tier: AutoModeTier, configurationService: Pick<IAgentConfigurationService, 'getRootValue'>, logService: ILogService, sessionId: string): AutoModeTier {
+	if (tier !== 'efficiency' || configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.Ensemble) !== true) {
+		return tier;
+	}
+	logService.info(`[Copilot:${sessionId}] Using Ensemble's '${defaultAutoModeTier}' in place of Auto "Optimize for" '${tier}'`);
+	return defaultAutoModeTier;
 }
 
 /** Resolves the shared override first, then the picker preference. */
@@ -545,7 +554,7 @@ export function resolveCopilotAutoTier(model: ModelSelection | undefined, config
 		return undefined;
 	}
 	logService.info(`[Copilot:${sessionId}] Using Auto "Optimize for" preference '${tier}'`);
-	return tier;
+	return toEnsembleTier(tier, configurationService, logService, sessionId);
 }
 
 /**
@@ -742,6 +751,7 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 			managedSettings: { permissions: this._managedSettingsService.permissions },
 			enableManagedSettings: true,
 			featureFlags: {
+				...catalogInstallationFeatureFlags,
 				CONNECTORS: copilotConnectorsEnabled,
 				TGREP: false,
 				CONTENT_EXCLUSION: true,
@@ -1032,17 +1042,20 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 		// Synthesize BYOK provider/model config (empty when BYOK is gated off or the
 		// renderer reports no BYOK models), merged into the returned config so both
 		// createSession and resumeSession advertise the models to the runtime.
-		const hydraFusionEnabled = this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.HydraFusion) === true;
-		const hydraFusionV2Enabled = hydraFusionEnabled && this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.HydraFusionV2) === true;
+		const ensembleEnabled = this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.Ensemble) === true;
+		const hydraFusionEnabled = ensembleEnabled || this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.HydraFusion) === true;
+		const hydraFusionV2Enabled = hydraFusionEnabled && (ensembleEnabled || this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.HydraFusionV2) === true);
 		// Throwaway chat surfaces skip memory, like the other heavyweight features they omit.
 		const memoryEnabled = !plan.isEphemeral && this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.Memory) === true;
 		const localMemoryEnabled = memoryEnabled && this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.LocalMemory) === true;
 		const tgrepEnabled = this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.Tgrep) === true;
+		const searchSubagentEnabled = this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.SearchSubagent) === true;
 		const copilotConnectorsEnabled = this._configurationService.getRootValue(platformRootSchema, AgentHostMcpConnectorsEnabledConfigKey) === true;
 		const stabilityOrderedPromptEnabled = this._configurationService.getRootValue(copilotCliConfigSchema, CopilotCliConfigKey.StabilityOrderedPrompt) === true;
 		// The runtime defaults CONNECTORS on, so the VS Code rollout gate must explicitly disable it.
 		const featureFlags = {
 			AUTO_APPROVAL: true,
+			...catalogInstallationFeatureFlags,
 			CONNECTORS: copilotConnectorsEnabled,
 			TGREP: tgrepEnabled,
 			CONTENT_EXCLUSION: true,
@@ -1078,7 +1091,11 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 		const customAgentsPromise = plan.isEphemeral ? Promise.resolve([]) : toSdkSessionCustomAgents(plugins, plan.resolvedAgentName, this._fileService);
 		const byokPromise = this.resolveByokSessionConfig(plan.sessionId);
 		// These are independent, so resolve them concurrently rather than paying each in turn.
-		const [byok, shellTools, customAgents] = await Promise.all([byokPromise, shellToolsPromise, customAgentsPromise]);
+		const [byok, shellTools, pluginCustomAgents] = await Promise.all([byokPromise, shellToolsPromise, customAgentsPromise]);
+		const customAgents = plan.isEphemeral ? [] : [
+			...pluginCustomAgents.filter(agent => !COPILOT_BUILTIN_AGENT_NAMES.has(agent.name)),
+			...buildCopilotBuiltinAgents(plan.snapshot.tools),
+		];
 		if (byok.models?.length) {
 			// The provider base URL carries the proxy's host:port, which correlates a
 			// session with its `ByokLmProxyService` bind when reading logs.
@@ -1111,6 +1128,8 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 			// Keep dynamic workflows disabled until Agent Host support is validated.
 			'builtin:run_dynamic_workflow',
 			'builtin:dynamic_workflows_manage',
+			// Keep the runtime's search subagent disabled until it is validated in the Agent Host.
+			...(searchSubagentEnabled ? [] : [`builtin:${CopilotToolName.SearchCodeSubagent}`]),
 			...(plan.isEphemeral ? EPHEMERAL_DISABLED_COPILOT_TOOLS : []),
 		];
 		const clientToolNames = filterClientToolNames(clientToolNamesFromSnapshot(plan.snapshot), availableTools, excludedTools);
@@ -1204,6 +1223,7 @@ export class CopilotSessionLauncher implements ICopilotSessionLauncher {
 			},
 			clientName: AGENT_HOST_COPILOT_CLIENT_NAME,
 			...(hydraFusionEnabled ? { enableExperimentalMode: true } : {}),
+			imageGeneration: { enabled: true },
 			featureFlags,
 			...toSdkExpAssignments(this._configurationService.getRootConfigValues?.()[CopilotCliVSCodeAssignmentContextKey]),
 			streaming: true,
